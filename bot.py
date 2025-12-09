@@ -1,69 +1,134 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import logging
 import requests
 import numpy as np
-import pandas as pd
-from datetime import datetime
-from telegram.ext import ApplicationBuilder, CommandHandler
-from config import TELEGRAM_BOT_TOKEN
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes
+)
 
-logging.basicConfig(level=logging.INFO)
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 log = logging.getLogger("SIS")
 
+# ----------------------------
+# CONFIG
+# ----------------------------
+import os
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "NO_TOKEN_SET")
+
+# ----------------------------
+# Safe fetch candles from Binance
+# ----------------------------
 def fetch_candles():
-    url = "https://api.binance.com/api/v3/klines"
-    r = requests.get(url, params={"symbol": "BTCUSDT", "interval": "1h", "limit": 200})
-    data = r.json()
-    return np.array([float(x[4]) for x in data])
+    """Безпечне отримання close-цін з Binance."""
+    url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=100"
 
-def ema(values, span):
-    return pd.Series(values).ewm(span=span).mean().iloc[-1]
+    try:
+        r = requests.get(url, timeout=10)
+    except Exception as e:
+        log.error(f"❌ Network error: {e}")
+        return []
 
-def header(title):
-    now = datetime.utcnow().strftime("%Y-%m-%d · %H:%M UTC")
-    return f"{title}\n{now}\n"
+    try:
+        data = r.json()
+    except Exception as e:
+        log.error(f"❌ Binance non-JSON: {e}")
+        return []
 
-async def analysis(update, context):
+    # Binance може повернути {"code": -1121, "msg": "..."}
+    if not isinstance(data, list):
+        log.error(f"❌ Binance error: {data}")
+        return []
+
+    if len(data) == 0:
+        log.error("❌ Binance returned empty array")
+        return []
+
+    # Extract close prices safely
+    closes = []
+    for c in data:
+        if isinstance(c, list) and len(c) > 4:
+            try:
+                closes.append(float(c[4]))
+            except:
+                continue
+
+    if not closes:
+        log.error("❌ No valid candle closes extracted")
+        return []
+
+    return np.array(closes)
+
+
+# ----------------------------
+# ANALYSIS COMMAND
+# ----------------------------
+async def analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("/analysis called")
+
     closes = fetch_candles()
+    if len(closes) < 10:
+        await update.message.reply_text("⚠️ Not enough market data to analyze.")
+        return
+
+    ma20 = np.mean(closes[-20:])
     price = closes[-1]
 
-    ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
+    text = f"""
+📊 *Market Analysis*
+Price: `{price}`
+MA20: `{ma20:.2f}`
 
-    trend = "bullish" if ema50 > ema200 else "bearish"
+Trend: {"UP" if price > ma20 else "DOWN"}
+"""
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-    text = header("BTC · Market Intelligence")
-    text += (
-        f"\nprice: {price:.2f}"
-        f"\ntrend: {trend}"
-        f"\nema50: {ema50:.2f}"
-        f"\nema200: {ema200:.2f}"
-        "\n"
-    )
 
-    await update.message.reply_text(text)
+# ----------------------------
+# TREND COMMAND
+# ----------------------------
+async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("/trend called")
 
-async def trend(update, context):
     closes = fetch_candles()
-    ema50_val = ema(closes, 50)
-    ema200_val = ema(closes, 200)
+    if len(closes) < 2:
+        await update.message.reply_text("⚠️ No data available.")
+        return
 
-    trend = "bullish" if ema50_val > ema200_val else "bearish"
+    trend_text = "UP 📈" if closes[-1] > closes[-2] else "DOWN 📉"
 
-    text = header("BTC · Trend Phase")
-    text += (
-        f"\ntrend: {trend}"
-        f"\nema50: {ema50_val:.2f}"
-        f"\nema200: {ema200_val:.2f}"
-    )
+    await update.message.reply_text(f"Current Trend: *{trend_text}*", parse_mode="Markdown")
 
-    await update.message.reply_text(text)
 
+# ----------------------------
+# APP INIT
+# ----------------------------
 def main():
+    log.info("S.I.S. BOT starting...")
+
+    if TELEGRAM_BOT_TOKEN == "NO_TOKEN_SET":
+        log.error("❌ TELEGRAM_BOT_TOKEN is missing!")
+        return
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("analysis", analysis))
     app.add_handler(CommandHandler("trend", trend))
+
     log.info("S.I.S. BOT running...")
     app.run_polling()
 
+
 if __name__ == "__main__":
     main()
+
